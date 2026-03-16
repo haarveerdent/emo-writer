@@ -1,0 +1,518 @@
+# ==============================================================================
+# EMO_WRITER — ACTUAL ARCHITECTURE PLAN
+# Reddit Emotional Story Curation Pipeline
+# Last updated: 2026-03-14
+# ==============================================================================
+# This is the living reference document for this project.
+# Update it whenever architectural decisions change.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 1. PROJECT METADATA
+# ------------------------------------------------------------------------------
+project:
+  name: "EMO_WRITER"
+  version: "1.0.0"
+  status: "staging"
+  description: >
+    Autonomous daily pipeline that scrapes high-traction emotional stories from
+    Reddit, filters for completed narratives, removes PII from both title and
+    body, polishes prose, and stores publication-ready stories in Supabase.
+  domain: "emotional content curation"
+  execution_trigger: "cron"
+  execution_interval: "0 8 * * *"   # 8:00 AM UTC daily
+
+  objectives:
+    - "Zero manual intervention after initial setup."
+    - "No Reddit API credentials required — use public JSON endpoints only."
+    - "Deduplicate using reddit_id stored in Supabase across runs."
+    - "Double-pass filtering and anonymization to minimize PII leakage."
+    - "Stay within free-tier infrastructure limits during MVP."
+
+
+# ------------------------------------------------------------------------------
+# 2. HIGH-LEVEL LAYERS
+# ------------------------------------------------------------------------------
+layers:
+
+  - id: ingestion
+    name: "Data Ingestion Layer"
+    alias: "The Scraper"
+    responsibility: >
+      Fetch raw text posts from Reddit subreddits via the public JSON API.
+      Filter by upvote traction and deduplicate against published history.
+    components:
+      - scheduler          # GitHub Actions cron
+      - reddit_json_api    # No auth needed — GET /r/{sub}/hot.json
+      - traction_filter    # Drop posts below MIN_UPVOTE_THRESHOLD (500)
+      - dedup_check        # Cross-reference reddit_id against Supabase
+    decision_notes: >
+      Playwright and PRAW were considered and rejected.
+      Playwright: overkill — Reddit data doesn't require JS rendering,
+      adds ~300MB Chromium overhead on GitHub Actions, and HTML scraping
+      is fragile to DOM changes.
+      PRAW: requires OAuth credentials (3 secrets); Reddit's public
+      hot.json endpoint returns identical structured data without any auth.
+      Plain requests + JSON API is faster, simpler, and credential-free.
+
+  - id: processing
+    name: "Agentic Processing Layer"
+    alias: "The Pipeline"
+    responsibility: >
+      Run each story through 7 specialized LLM agent nodes in a LangGraph DAG.
+      Double-pass pattern: every critical check (narrative resolution, PII)
+      uses two independent agents to reduce false negatives.
+    components:
+      - langgraph_dag         # StateGraph with conditional early-exit edges
+      - pydantic_state        # PipelineState carries data between all nodes
+      - per_story_llm_calls   # One LLM call per story (not batched) for reliability
+
+  - id: storage
+    name: "Storage Layer"
+    alias: "The Store"
+    responsibility: >
+      Persist publication-ready stories to Supabase PostgreSQL.
+      Expose read endpoints to the future Next.js frontend.
+    components:
+      - supabase_postgres     # published_stories table
+      - reddit_id_dedup       # UNIQUE constraint on reddit_id prevents re-publishing
+      - rls_policies          # service role: full access; anon key: read-only
+
+  - id: presentation
+    name: "Presentation Layer"
+    alias: "The Frontend"
+    responsibility: >
+      Display curated stories to end-users. Not yet built — planned for next phase.
+    components:
+      - next_js_app_router    # Next.js 14+ with App Router
+      - tailwind_shadcn       # Tailwind CSS + shadcn/ui
+      - supabase_anon_key     # Read-only public access
+      - isr_revalidation      # Cache invalidation via REVALIDATE_SECRET webhook
+    status: "planned — not yet implemented"
+
+
+# ------------------------------------------------------------------------------
+# 3. DATA SOURCES
+# ------------------------------------------------------------------------------
+sources:
+
+  primary:
+    - name: "Reddit Public JSON API"
+      type: "rest_api"
+      endpoint: "https://www.reddit.com/r/{subreddit}/hot.json"
+      auth: "none"
+      params:
+        limit: 100
+        raw_json: 1
+      headers:
+        User-Agent: "EMO_WRITER/1.0"
+      notes: >
+        No OAuth or API keys required. Reddit requires a User-Agent header
+        or returns 429. Returns structured JSON — no HTML parsing needed.
+        Rate limit: ~1 req/sec; GitHub Actions runs once daily so this is
+        never a concern.
+
+  target_subreddits:
+    # Original
+    - TrueOffMyChest
+    - confessions
+    - offmychest
+    - relationship_advice
+    # High-volume resolved drama
+    - AITAH
+    - AmItheAsshole
+    - tifu
+    # Revenge / vindication
+    - ProRevenge
+    - pettyrevenge
+    - MaliciousCompliance
+    # Family & toxic relationships
+    - raisedbynarcissists
+    - JustNoMIL
+    - JUSTNOFAMILY
+    - entitledparents
+    - EstrangedAdultChildren
+    # Grief & survival (no sexual focus)
+    - survivorsofabuse
+    - widowers
+    # Workplace & career
+    - antiwork
+    - WorkReform
+    - jobs
+    - careerguidance
+    - ExperiencedDevs
+    - cscareerquestions
+    - AskHR
+    - recruitinghell
+    - managers
+
+
+# ------------------------------------------------------------------------------
+# 4. SCHEDULER
+# ------------------------------------------------------------------------------
+scheduler:
+  tool: "GitHub Actions"
+  cron_expression: "0 8 * * *"
+  timeout_minutes: 30
+  runner: "ubuntu-latest"
+  manual_trigger: true    # workflow_dispatch enabled for testing
+  pip_caching: true       # actions/setup-python cache: pip
+
+
+# ------------------------------------------------------------------------------
+# 5. RESILIENCE
+# ------------------------------------------------------------------------------
+resilience:
+  retry_strategy: "exponential_backoff"
+  max_retries: 3
+  base_delay_seconds: 2       # delays: 2s, 4s, 8s
+  timeout_per_request_seconds: 10
+  retry_scope: >
+    @with_retry wraps individual LLM calls only — not the full agent loop.
+    A single story failing after max_attempts is dropped and logged;
+    the rest of the batch continues unaffected.
+  early_exit: >
+    LangGraph conditional edges after Agent 1, 2, and 3.
+    If any filter stage produces zero stories the graph routes to END
+    cleanly rather than invoking downstream agents wastefully.
+
+
+# ------------------------------------------------------------------------------
+# 6. PIPELINE — 8-AGENT DAG
+# ------------------------------------------------------------------------------
+pipeline:
+
+  framework: "LangGraph (StateGraph)"
+  state_model: "PipelineState (Pydantic v2)"
+  story_model: "StoryRecord — reddit_id, title, content, subreddit, upvotes"
+
+  scraping_config:
+    post_limit: 100                 # per subreddit fetch
+    min_upvote_threshold: 500
+    max_content_chars: 4000         # truncated at sentence boundary
+
+  agents:
+
+    - id: reddit_scraper
+      step: 1
+      role: "Emotional Content Harvester"
+      action: "batch_scrape"
+      llm: false
+      input: published_story_ids
+      output: raw_stories
+      notes: >
+        Uses requests + Reddit public JSON API (no PRAW, no credentials).
+        Filters: is_self=true, score >= 500, not in published_story_ids,
+        selftext not [removed]/[deleted].
+
+    - id: narrative_resolution_evaluator
+      step: 2
+      role: "Story Completeness Filter (Pass 1)"
+      action: "filter"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.0
+      accept_condition: "response starts with ACCEPT"
+      input: raw_stories
+      output: filtered_stories
+
+    - id: resolution_consensus_evaluator
+      step: 3
+      role: "Story Completeness Auditor (Pass 2)"
+      action: "filter"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.0
+      accept_condition: "response starts with ACCEPT_CONSENSUS"
+      input: filtered_stories
+      output: consensus_filtered_stories
+
+    - id: pii_anonymizer
+      step: 4
+      role: "Privacy Editor (Pass 1)"
+      action: "map"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.0
+      scope: "title AND content"
+      prompt_format: "TITLE: ...\nBODY: ..."
+      response_format: "TITLE: ...\nBODY: ..."
+      input: consensus_filtered_stories
+      output: anonymized_stories
+      notes: >
+        Processes BOTH title and body. Title is often overlooked but
+        frequently contains real names on Reddit.
+
+    - id: pii_verification_agent
+      step: 5
+      role: "Privacy Auditor (Pass 2)"
+      action: "map"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.0
+      scope: "title AND content"
+      prompt_format: "TITLE: ...\nBODY: ..."
+      response_format: "TITLE: ...\nBODY: ..."
+      input: anonymized_stories
+      output: verified_anonymized_stories
+
+    - id: editorial_polisher
+      step: 6
+      role: "Content Formatter (Pass 1)"
+      action: "map"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.4
+      scope: "title AND content"
+      prompt_format: "TITLE: ...\nBODY: ..."
+      response_format: "TITLE: ...\nBODY: ..."
+      input: verified_anonymized_stories
+      output: final_polished_stories
+
+    - id: final_qa_agent
+      step: 7
+      role: "Final Quality Assurance (Pass 2)"
+      action: "map"
+      llm: true
+      model: "gpt-5-nano"
+      temperature: 0.1
+      scope: "title AND content"
+      prompt_format: "TITLE: ...\nBODY: ..."
+      response_format: "TITLE: ...\nBODY: ..."
+      input: final_polished_stories
+      output: qa_passed_stories
+      checks:
+        - "prose flows naturally"
+        - "zero real names or specific locations in title or body"
+        - "story has a definitive ending"
+
+    - id: supabase_storage
+      step: 8
+      role: "Database Archiver"
+      action: "map"
+      llm: false
+      method: "upsert with on_conflict=reddit_id"
+      input: qa_passed_stories
+      output: database_insert_status
+
+  conditional_edges:
+    - after: reddit_scraper
+      condition: "raw_stories is empty → END"
+    - after: narrative_resolution_evaluator
+      condition: "filtered_stories is empty → END"
+    - after: resolution_consensus_evaluator
+      condition: "consensus_filtered_stories is empty → END"
+
+
+# ------------------------------------------------------------------------------
+# 7. DATABASE SCHEMA
+# ------------------------------------------------------------------------------
+database:
+  engine: "PostgreSQL 15+"
+  host: "Supabase"
+  project_url: "https://vydbfhoqqmyfzwrluyua.supabase.co"
+
+  tables:
+
+    - name: "published_stories"
+      migration: "supabase/migrations/001_create_published_stories.sql"
+      columns:
+        - { name: id,         type: UUID,         constraints: "PRIMARY KEY DEFAULT gen_random_uuid()" }
+        - { name: reddit_id,  type: VARCHAR(20),   constraints: "NOT NULL UNIQUE" }
+        - { name: title,      type: TEXT,          constraints: NOT NULL }
+        - { name: content,    type: TEXT,          constraints: NOT NULL }
+        - { name: subreddit,  type: VARCHAR(100) }
+        - { name: upvotes,    type: INTEGER,       constraints: "DEFAULT 0" }
+        - { name: created_at, type: TIMESTAMPTZ,   constraints: "DEFAULT NOW() NOT NULL" }
+      indexes:
+        - idx_published_stories_reddit_id   # fast dedup lookup at pipeline startup
+        - idx_published_stories_created_at  # DESC — for display/dashboard queries
+      rls:
+        enabled: true
+        policies:
+          - "Public read access: SELECT for all (anon key safe)"
+          - "No INSERT/UPDATE/DELETE for anon role (write-blocked)"
+
+
+# ------------------------------------------------------------------------------
+# 8. ENVIRONMENT VARIABLES
+# Source of truth: .env (local) and GitHub Actions Secrets (CI)
+# ------------------------------------------------------------------------------
+environment_variables:
+
+  required:
+    - name: OPENAI_API_KEY
+      used_by: "pipeline/clients/openai_client.py"
+    - name: SUPABASE_URL
+      used_by: "pipeline/config.py"
+    - name: SUPABASE_SERVICE_ROLE_KEY
+      used_by: "pipeline/config.py"
+      note: "Service role key — never expose to frontend"
+
+  frontend_only:
+    - name: NEXT_PUBLIC_SUPABASE_URL
+      used_by: "Next.js frontend (planned)"
+    - name: NEXT_PUBLIC_SUPABASE_ANON_KEY
+      used_by: "Next.js frontend — read-only anon key"
+    - name: REVALIDATE_SECRET
+      used_by: "ISR cache invalidation webhook (planned)"
+
+  removed:
+    - REDDIT_CLIENT_ID       # not needed — using public JSON API
+    - REDDIT_CLIENT_SECRET   # not needed — using public JSON API
+    - REDDIT_USER_AGENT      # hardcoded in pipeline/clients/reddit_client.py
+
+
+# ------------------------------------------------------------------------------
+# 9. FRONTEND (PLANNED)
+# ------------------------------------------------------------------------------
+frontend:
+  framework: "Next.js 14+ (App Router)"
+  language: "TypeScript"
+  styling: "Tailwind CSS + shadcn/ui"
+  rendering_strategy: "ISR with on-demand revalidation"
+  hosting: "Vercel"
+  data_access: "Supabase anon key (read-only)"
+  cache_invalidation: "POST /webhook/revalidate with REVALIDATE_SECRET"
+  status: "not yet implemented"
+
+
+# ------------------------------------------------------------------------------
+# 10. TOKEN & COST MANAGEMENT
+# ------------------------------------------------------------------------------
+token_management:
+  model: "gpt-5-nano"
+  api_endpoint: "https://api.openai.com/v1/responses"
+  sdk_method: "client.responses.create()"
+  sdk_params:
+    instructions: "system prompt"
+    input: "user message"
+    response_field: "response.output_text"
+  pricing:
+    input_per_1m_tokens: "$0.05"
+    output_per_1m_tokens: "$0.40"
+  note: >
+    Uses OpenAI Responses API — NOT chat.completions.
+    Requires openai>=1.50.0. Parameters differ from chat API:
+    'instructions' (not 'system'), 'input' (not 'messages'),
+    '.output_text' (not '.choices[0].message.content').
+
+  max_content_chars: 4000
+  truncation_strategy: "sentence boundary — never mid-sentence"
+  batching: >
+    Stories processed one-at-a-time per agent (not batched into a single
+    prompt). Simpler response parsing, more reliable ACCEPT/REJECT detection,
+    and cost is negligible at gpt-5-nano pricing.
+
+  prompt_caching:
+    enabled: true
+    strategy: >
+      System prompts are module-level constants reused across all stories
+      in a run. The Responses API caches the prompt prefix after the first
+      call, reducing repeat input token cost by up to 80%.
+
+
+# ------------------------------------------------------------------------------
+# 11. TECH STACK
+# ------------------------------------------------------------------------------
+tech_stack:
+  worker_language: "Python 3.11+"
+
+  python_libraries:
+    - langchain==0.3.25
+    - langgraph==0.2.70
+    - langchain-openai==0.3.18
+    - "openai>=1.50.0"       # minimum for Responses API support
+    - requests==2.32.3       # Reddit JSON scraping (no PRAW)
+    - supabase==2.15.0
+    - pydantic==2.11.4
+    - tiktoken==0.9.0
+    - python-dotenv==1.1.0
+    - tenacity==9.1.2
+
+  typescript_libraries_planned:
+    - next
+    - react
+    - tailwindcss
+    - "@supabase/supabase-js"
+    - lucide-react
+
+  infrastructure:
+    worker_automation: "GitHub Actions"
+    database:          "Supabase (PostgreSQL 15+)"
+    frontend_hosting:  "Vercel (planned)"
+    cache:             "Vercel ISR (planned)"
+
+
+# ------------------------------------------------------------------------------
+# 12. PROJECT FILE STRUCTURE
+# ------------------------------------------------------------------------------
+file_structure: |
+  EMO_WRITER/
+  ├── .env                              # local secrets (never commit)
+  ├── .env.example                      # safe template
+  ├── .gitignore
+  ├── requirements.txt
+  ├── agent_system.yaml                 # original agent spec
+  ├── architecture_plan.yaml            # THIS FILE — living reference doc
+  │
+  ├── .github/
+  │   └── workflows/
+  │       └── daily_pipeline.yml        # cron: 0 8 * * *, workflow_dispatch
+  │
+  ├── pipeline/
+  │   ├── config.py                     # all tunable settings in one place
+  │   ├── state.py                      # PipelineState + StoryRecord (Pydantic v2)
+  │   ├── graph.py                      # LangGraph DAG assembly
+  │   ├── main.py                       # entrypoint: load IDs → build graph → invoke → log
+  │   ├── agents/
+  │   │   ├── reddit_scraper.py         # Agent 1 — requests + public JSON API
+  │   │   ├── narrative_evaluator.py    # Agent 2 — Pass 1 narrative filter
+  │   │   ├── consensus_evaluator.py    # Agent 3 — Pass 2 consensus filter
+  │   │   ├── pii_anonymizer.py         # Agent 4 — Pass 1 PII (title + content)
+  │   │   ├── pii_verifier.py           # Agent 5 — Pass 2 PII audit (title + content)
+  │   │   ├── editorial_polisher.py     # Agent 6 — Pass 1 polish (title + content)
+  │   │   ├── final_qa.py               # Agent 7 — Pass 2 QA gate (title + content)
+  │   │   └── supabase_storage.py       # Agent 8 — upsert, no LLM
+  │   ├── clients/
+  │   │   ├── openai_client.py          # Responses API wrapper
+  │   │   ├── reddit_client.py          # fetch_hot_posts via requests
+  │   │   └── supabase_client.py        # uses SUPABASE_SERVICE_ROLE_KEY
+  │   └── utils/
+  │       ├── retry.py                  # @with_retry exponential backoff
+  │       ├── truncation.py             # sentence-boundary truncation
+  │       └── logging_config.py
+  │
+  └── supabase/
+      └── migrations/
+          └── 001_create_published_stories.sql
+
+
+# ------------------------------------------------------------------------------
+# 13. SECURITY
+# ------------------------------------------------------------------------------
+security:
+  api_keys:
+    rule: >
+      SUPABASE_SERVICE_ROLE_KEY is only used server-side in the pipeline worker.
+      Frontend uses NEXT_PUBLIC_SUPABASE_ANON_KEY (read-only, safe to expose).
+  rls: "Row-level security enabled on published_stories — anon key cannot write."
+  secrets_in_ci: "All secrets injected as GitHub Actions env vars, never in code."
+  env_file: ".env must be in .gitignore — contains real credentials."
+
+
+# ------------------------------------------------------------------------------
+# 14. MONITORING
+# ------------------------------------------------------------------------------
+monitoring:
+  logs:
+    tool: "GitHub Actions logs + Python stdout"
+    fields_logged:
+      - scraped          # stories fetched from Reddit
+      - after_pass1      # survived narrative_evaluator
+      - after_pass2      # survived consensus_evaluator
+      - published        # successfully inserted to Supabase
+      - errors           # insert failures
+      - duration_ms      # total run time
+  alerting: "GitHub Actions email notification on workflow failure"

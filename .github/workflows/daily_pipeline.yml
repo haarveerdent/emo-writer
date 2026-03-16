@@ -1,0 +1,36 @@
+name: emo-daily-pipeline
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 8:00 AM UTC daily
+  workflow_dispatch:        # Manual trigger for testing
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m pipeline.main
+
+      - name: Revalidate frontend cache
+        run: |
+          curl -sf -X POST https://emo-stories.vercel.app/api/revalidate \
+            -H "x-revalidate-secret: ${{ secrets.REVALIDATE_SECRET }}"

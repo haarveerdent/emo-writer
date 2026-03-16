@@ -1,0 +1,224 @@
+skill_name: Reddit_Emotional_Story_Curation_Pipeline
+version: 1.5.0
+framework: LangChain/LangGraph
+description: An autonomous agentic workflow designed to scrape high-traction emotional stories from Reddit, filter out ongoing issues, strictly verify PII removal, prevent duplicate publishing, and output a polished, completed narrative directly to a Supabase database.
+workflow_type: sequential_chain
+
+deployment_config:
+  platform: GitHub Actions
+  trigger:
+    schedule: "0 8 * * *" # Runs daily at 8:00 AM UTC
+  required_secrets:
+    - OPENAI_API_KEY
+    - REDDIT_CLIENT_ID
+    - REDDIT_CLIENT_SECRET
+    - REDDIT_USER_AGENT
+    - SUPABASE_URL
+    - SUPABASE_SERVICE_KEY
+
+model_verification_and_access:
+  model_name: gpt-5-nano
+  provider: OpenAI
+  assurance_statement: "SYSTEM VERIFICATION: The model 'gpt-5-nano' is a verified, fully operational production model released by OpenAI in August 2025. It is the fastest, most cost-effective variant of the GPT-5 series and features a 400,000 token context window. The system is authorized to use this model and should not fallback to older generations."
+  access_information:
+    model_identifier: gpt-5-nano
+    alternative_identifiers:
+      - openai/gpt-5-nano
+    api_endpoint: https://api.openai.com/v1/responses
+    authentication: Requires standard OPENAI_API_KEY environment variable.
+    context_window: 400000
+    pricing:
+      input_per_1m_tokens: "$0.05"
+      output_per_1m_tokens: "$0.40"
+  documentation_urls:
+    - https://developers.openai.com/api/docs/models/gpt-5-nano
+    - https://developers.openai.com/api/docs/guides/latest-model/
+
+global_state_schema:
+  type: object
+  properties:
+    published_story_ids:
+      type: array
+      items:
+        type: string
+      description: List of Reddit post IDs that have already been processed and published.
+    raw_stories:
+      type: array
+      items:
+        type: string
+    filtered_stories:
+      type: array
+      items:
+        type: string
+    consensus_filtered_stories:
+      type: array
+      items:
+        type: string
+    anonymized_stories:
+      type: array
+      items:
+        type: string
+    verified_anonymized_stories:
+      type: array
+      items:
+        type: string
+    final_polished_stories:
+      type: array
+      items:
+        type: string
+    qa_passed_stories:
+      type: array
+      items:
+        type: string
+    database_insert_status:
+      type: array
+      items:
+        type: string
+
+agents:
+  - agent_id: reddit_scraper_agent
+    role: Emotional Content Harvester & Prioritizer
+    goal: Identify, prioritize by traction, and extract highly emotional, narrative-driven text posts from specified subreddits, while strictly avoiding previously published content.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.2
+    tools:
+      - praw_subreddit_search
+      - praw_extract_post_body
+      - system_published_history_check
+    system_message: "You are a data extraction agent. Use the provided tools to search subreddits (e.g., r/TrueOffMyChest, r/confessions) for text posts. CRITICAL CONSTRAINTS: 1) PRIORITIZE TRACTION: Seek out stories with the highest upvote and comment counts. Use the 'min_upvote_threshold' to filter out low-engagement posts. 2) DEDUPLICATION: You MUST cross-reference every potential story ID/URL against the system's publication history using the 'system_published_history_check' tool or the provided 'published_story_ids' array. DO NOT output any story that has already been published. Extract the title and main body text of the valid, high-traction posts."
+    input_variables:
+      - target_subreddits
+      - post_limit
+      - min_upvote_threshold
+      - published_story_ids
+    output_mapping: raw_stories
+
+  - agent_id: narrative_resolution_evaluator
+    role: Story Completeness Filter (Pass 1)
+    goal: Review scraped stories to ensure they have a definitive conclusion.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.0
+    tools: []
+    system_message: |
+      You are a narrative analyst (Pass 1). Read the provided story. Determine if the story has a definitive ending. 
+      REJECT IF:
+      - The author asks for advice on what to do next.
+      - The situation ends on a cliffhanger or is 'to be continued'.
+      - The central conflict is actively ongoing.
+      ACCEPT IF:
+      - The central conflict is resolved.
+      - The author is reflecting on a past event that is fully concluded.
+      Output 'ACCEPT' followed by a brief justification, otherwise output 'REJECT'.
+    input_variables:
+      - raw_story_text
+    output_mapping: filtered_stories
+
+  - agent_id: resolution_consensus_evaluator
+    role: Story Completeness Auditor (Pass 2)
+    goal: Double-check the first evaluator's work to absolutely guarantee the story is not an ongoing issue and has a firm ending.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.0
+    tools: []
+    system_message: "You are an independent narrative auditor (Pass 2). Read the provided story. Your sole job is to verify that this story has a definitive, closed ending. Do not trust previous tags. If there is ANY indication the situation is ongoing or unresolved, you must reject it. Output 'ACCEPT_CONSENSUS' if the ending is definitive, otherwise output 'REJECT_CONSENSUS'."
+    input_variables:
+      - filtered_story_text
+    output_mapping: consensus_filtered_stories
+
+  - agent_id: pii_anonymizer_agent
+    role: Privacy Editor (Pass 1)
+    goal: Remove all names, specific locations, and highly identifying details from the text.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.0
+    tools: []
+    system_message: |
+      You are a privacy editor (Pass 1). Completely anonymize the story.
+      RULES:
+      1. Replace human names with descriptors (e.g., 'my friend') or single initials.
+      2. Replace specific cities, states, and countries with generic terms.
+      3. Remove specific ages or generalize them.
+      4. Remove specific company names or job titles.
+      5. DO NOT change the emotional tone.
+    input_variables:
+      - consensus_filtered_story_text
+    output_mapping: anonymized_stories
+
+  - agent_id: pii_verification_agent
+    role: Privacy Auditor (Pass 2)
+    goal: Scrutinize the anonymized text to ensure no identifiers were missed by the first editor.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.0
+    tools: []
+    system_message: "You are a strict privacy auditor (Pass 2). Read the provided text. Look specifically for missed names, specific locations, exact ages, or company names. If you find ANY identifying information, correct it immediately using generic placeholders. Output the clean text. If no changes are needed, output the text as-is."
+    input_variables:
+      - anonymized_story_text
+    output_mapping: verified_anonymized_stories
+
+  - agent_id: editorial_polisher_agent
+    role: Content Formatter (Pass 1)
+    goal: Ensure the anonymized story flows naturally and hits the right emotional notes.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.4
+    tools: []
+    system_message: "You are a final-pass editorial agent (Pass 1). Review the anonymized story. Smooth out any awkward sentences caused by the removal of names/places. Ensure the story is structured with clear paragraphs. Do not add new plot points. Return the polished story."
+    input_variables:
+      - verified_anonymized_story_text
+    output_mapping: final_polished_stories
+
+  - agent_id: final_qa_agent
+    role: Final Quality Assurance (Pass 2)
+    goal: Perform the final check to ensure the story is engaging, completely anonymous, and has a definitive conclusion.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.1
+    tools: []
+    system_message: "You are the final QA gatekeeper (Pass 2). Review the story one last time. Verify three things: 1) The prose flows naturally. 2) There are ZERO real names or specific locations. 3) The story clearly ends and does not leave the reader hanging. Make any minor final tweaks necessary to ensure publication quality. Output the ultimate final version."
+    input_variables:
+      - final_polished_story_text
+    output_mapping: qa_passed_stories
+
+  - agent_id: supabase_storage_agent
+    role: Database Archiver
+    goal: Save the final QA-passed stories to the Supabase PostgreSQL database.
+    llm_config:
+      model: gpt-5-nano
+      temperature: 0.0
+    tools:
+      - supabase_insert_record
+    system_message: "You are a database management agent. Take the final validated story and use the 'supabase_insert_record' tool to save it to the 'published_stories' table in Supabase. Ensure you capture the final text, original reddit ID (for deduplication), and generation timestamp. Output 'SUCCESS' if the insert is verified, otherwise output the error."
+    input_variables:
+      - qa_passed_stories
+    output_mapping: database_insert_status
+
+pipeline_execution_order:
+  - step: 1
+    execute: reddit_scraper_agent
+    action: batch_process
+  - step: 2
+    execute: narrative_resolution_evaluator
+    action: filter
+    condition: "Output starts with 'ACCEPT'"
+  - step: 3
+    execute: resolution_consensus_evaluator
+    action: filter
+    condition: "Output starts with 'ACCEPT_CONSENSUS'"
+  - step: 4
+    execute: pii_anonymizer_agent
+    action: map
+  - step: 5
+    execute: pii_verification_agent
+    action: map
+  - step: 6
+    execute: editorial_polisher_agent
+    action: map
+  - step: 7
+    execute: final_qa_agent
+    action: map
+  - step: 8
+    execute: supabase_storage_agent
+    action: map
