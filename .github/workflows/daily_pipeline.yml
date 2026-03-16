@@ -3,7 +3,7 @@ name: emo-daily-pipeline
 on:
   schedule:
     - cron: "0 8 * * *"   # 8:00 AM UTC daily
-  workflow_dispatch:        # Manual trigger for testing
+  workflow_dispatch: # Manual trigger for testing
 
 jobs:
   run-pipeline:
