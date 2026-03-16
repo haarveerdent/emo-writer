@@ -9,6 +9,8 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repository
@@ -33,4 +35,5 @@ jobs:
       - name: Revalidate frontend cache
         run: |
           curl -sf -X POST https://emo-stories.vercel.app/api/revalidate \
-            -H "x-revalidate-secret: ${{ secrets.REVALIDATE_SECRET }}"
+            -H "x-revalidate-secret: ${{ secrets.REVALIDATE_SECRET }}" \
+            || echo "Revalidate failed (non-fatal)"
